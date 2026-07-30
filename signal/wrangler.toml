@@ -1,0 +1,12 @@
+name = "v1-monitor"
+main = "index.js"
+compatibility_date = "2024-01-01"
+account_id = "503d56d255b8bfd89e71160f3f98f8df"
+
+kv_namespaces = [
+  { binding = "V1_POOL", id = "7d4e8decec9849e8becab243a3d4de15" },
+  { binding = "V1_STATE", id = "1074343ba32f4d43be99455ff88cfecb" }
+]
+
+[triggers]
+crons = ["0 */4 * * *"]
