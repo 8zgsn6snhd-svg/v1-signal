@@ -54,22 +54,27 @@ async function run(sch){
   const n=new Date(),ns=n.toISOString().slice(0,16).replace('T',' ');
   if(sch)try{await pu('['+CFG.VERSION+']',ns);}catch(e){}
 
-  // 读KV + 时间戳检查
+  // 读KV + 时间戳检查 + 诊断日志
   const keys=['data_a','data_b','data_c'];
-  const kd={};let tsInfo={},expired=[];
+  const kd={};let tsInfo={},expired=[],rawKvs={};
   for(const key of keys){
     const v=await kvR(key);
+    rawKvs[key]=v;
+    log('KV_READ',key+':');
     if(v&&v.d){
+      const cCount=Object.keys(v.d).length;
+      const ageS=Math.round((Date.now()-v.ts)/1000);
+      log('KV_READ','  exists=true age='+ageS+'秒 coins='+cCount);
       Object.assign(kd,v.d);
       tsInfo[key]={ts:v.ts,age:Date.now()-v.ts};
       if(Date.now()-v.ts>4.5*3600000)expired.push(key);
-    }else{tsInfo[key]={ts:0,age:-1};expired.push(key);}
+    }else{
+      log('KV_READ','  MISSING');
+      tsInfo[key]={ts:0,age:-1};expired.push(key);
+    }
   }
   const ok=CFG.BACKUP.filter(c=>kd[c]&&kd[c].c).length;
-  log('KV','A:'+(tsInfo.data_a.age?Math.round(tsInfo.data_a.age/60000)+'min':'无')+
-       ' B:'+(tsInfo.data_b.age?Math.round(tsInfo.data_b.age/60000)+'min':'无')+
-       ' C:'+(tsInfo.data_c.age?Math.round(tsInfo.data_c.age/60000)+'min':'无')+
-       ' 合计:'+ok+'/34');
+  log('MERGE','total='+ok+'/34');
   if(expired.length)log('WARN','数据过期:'+expired.join(','));
 
   let btcDir='';const bk=kd['BTC'];
@@ -86,6 +91,28 @@ async function run(sch){
   sigs.sort((a,b)=>b.sc-a.sc);
   log('STRATEGY','信号:'+sigs.length);
   for(const s of sigs)log('SIGNAL',s.c+' '+(s.dir===1?'S':'L')+' 评分:'+s.sc+' R:'+s.R.toFixed(1));
+
+  // 诊断报告
+  if(ok<CFG.BACKUP.length-2){
+    log('DIAG','=== 数据不足原因 ===');
+    const kvA=rawKvs.data_a, kvB=rawKvs.data_b, kvC=rawKvs.data_c;
+    const aOk=kvA&&kvA.d?Object.keys(kvA.d).length:0;
+    const bOk=kvB&&kvB.d?Object.keys(kvB.d).length:0;
+    const cOk=kvC&&kvC.d?Object.keys(kvC.d).length:0;
+    if(!kvA||!kvA.d)log('DIAG','KV缺失: data_a不存在');
+    else if(aOk<12)log('DIAG','DATA不足: data_a '+aOk+'/12');
+    if(!kvB||!kvB.d)log('DIAG','KV缺失: data_b不存在');
+    else if(bOk<12)log('DIAG','DATA不足: data_b '+bOk+'/12');
+    if(!kvC||!kvC.d)log('DIAG','KV缺失: data_c不存在');
+    else if(cOk<10)log('DIAG','DATA不足: data_c '+cOk+'/10');
+    for(const e of expired){
+      const info=tsInfo[e];
+      const ageS=info&&info.age>0?Math.round(info.age/1000):'?';
+      log('DIAG','数据过期: '+e+' age='+ageS+'秒');
+    }
+    const missing=CFG.BACKUP.filter(c=>!kd[c]||!kd[c].c);
+    if(missing.length)log('DIAG','缺失币种('+missing.length+'): '+missing.join(','));
+  }
 
   const status=ok>=CFG.BACKUP.length-2?'正常':(ok>=CFG.BACKUP.length*0.7?'数据不足':'数据严重不足');
   let r='['+CFG.VERSION+'] '+ns+(btcDir?' BTC:'+btcDir:'')+'\n';
@@ -107,8 +134,28 @@ async function health(e){
   const j={status:'ok',data_a:a+'/12',data_b:b+'/12',data_c:c+'/10',okx_key:typeof OKX_API_KEY!=='undefined'?'✅':'❌'};
   return new Response(JSON.stringify(j),{headers:{'Content-Type':'application/json'}});
 }
+async function testDebug(e){
+  const ka=await kvR('data_a');const kb=await kvR('data_b');const kc=await kvR('data_c');
+  const a=ka&&ka.d?Object.keys(ka.d).length:0;
+  const b=kb&&kb.d?Object.keys(kb.d).length:0;
+  const c=kc&&kc.d?Object.keys(kc.d).length:0;
+  const ageA=ka?Math.round((Date.now()-ka.ts)/1000):-1;
+  const ageB=kb?Math.round((Date.now()-kb.ts)/1000):-1;
+  const ageC=kc?Math.round((Date.now()-kc.ts)/1000):-1;
+  const j={
+    data_a:{success:a,failed:12-a,age:ageA+'s',ts:ka?new Date(ka.ts).toISOString():null},
+    data_b:{success:b,failed:12-b,age:ageB+'s',ts:kb?new Date(kb.ts).toISOString():null},
+    data_c:{success:c,failed:10-c,age:ageC+'s',ts:kc?new Date(kc.ts).toISOString():null},
+    merge:{total:a+b+c,expected:34},
+    kv_token:CF_TOK?'✅':'❌',
+    push_token:CFG.TOKEN?'✅':'❌',
+    version:CFG.VERSION
+  };
+  return new Response(JSON.stringify(j),{headers:{'Content-Type':'application/json'}});
+}
 addEventListener('fetch',e=>{const u=new URL(e.request.url);
   if(u.pathname==='/health')return e.respondWith(health(e));
+  if(u.pathname==='/testdebug')return e.respondWith(testDebug(e));
   if(u.pathname==='/testpush'){const ts=new Date().toISOString().slice(0,19).replace('T',' ');
     return e.respondWith(pu('['+CFG.VERSION+'] TEST '+ts,'诊断推送<br>时间:'+ts+'<br>Token:'+(CFG.TOKEN?'已配置':'缺失')).then(r=>new Response('OK code='+r.code)));
   }

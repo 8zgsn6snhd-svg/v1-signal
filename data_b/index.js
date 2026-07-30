@@ -34,27 +34,57 @@ async function kvW(key,val){
 }
 async function run(){
   const st=Date.now();log('START','');
-  const kd={};let fail=[];
+  log('DATA_B_START','time='+new Date().toISOString());
+  log('DATA_B_START','请求币数量: '+COINS.length);
+  const kd={};let fail=[];const details=[];
   for(const c of COINS){
+    const reqSt=Date.now();
+    log('COIN_START',c+':');
     try{
       const d=await okxF('/api/v5/market/candles?instId='+c+'-USDT-SWAP&bar=4H&limit=200');
-      if(!d||d.length<50){log('SHORT',c+' bars='+(d?d.length:0));fail.push(c);continue;}
+      const reqT=Date.now()-reqSt;
+      if(!d||d.length<50){
+        const len=d?d.length:0;
+        log('COIN_END',c+' FAILED');
+        log('COIN_END','  HTTP=200 OKX=0 candles='+len+' time='+reqT+'ms');
+        fail.push(c);
+        details.push(c+' FAIL bars='+len);
+        if(fail.length||c!==COINS[COINS.length-1])await new Promise(w=>setTimeout(w,300));
+        continue;
+      }
       const dr=d.reverse();
       kd[c]={h:dr.map(k=>+k[2]),l:dr.map(k=>+k[3]),c:dr.map(k=>+k[4]),v:dr.map(k=>+k[5]),t:dr.map(k=>+k[0])};
-    }catch(e){log('ERR',c+' '+e.message);fail.push(c);}
+      const close=dr[dr.length-1]?.[4];
+      log('COIN_END',c+' success HTTP=200 OKX=0 candles='+d.length+' close='+close+' time='+reqT+'ms');
+      details.push(c+' OK bars='+d.length+' close='+close);
+    }catch(e){
+      const reqT=Date.now()-reqSt;
+      log('COIN_END',c+' FAILED error='+e.message+' time='+reqT+'ms');
+      fail.push(c);
+      details.push(c+' ERR '+e.message);
+    }
     if(fail.length||c!==COINS[COINS.length-1])await new Promise(w=>setTimeout(w,300));
   }
+  // 重试失败的
   if(fail.length){log('RETRY','失败币:'+fail.join(','));
     for(const c of fail){try{
+      log('RETRY_START',c);
       const d=await okxF('/api/v5/market/candles?instId='+c+'-USDT-SWAP&bar=4H&limit=200');
       if(d&&d.length>50){const dr=d.reverse();
         kd[c]={h:dr.map(k=>+k[2]),l:dr.map(k=>+k[3]),c:dr.map(k=>+k[4]),v:dr.map(k=>+k[5]),t:dr.map(k=>+k[0])};
-        fail=fail.filter(x=>x!==c);}
+        fail=fail.filter(x=>x!==c);
+        log('RETRY_OK',c+' recovered');}
+      else log('RETRY_FAIL',c+' still short bars='+(d?d.length:0));
     }catch(e){log('RETRY_ERR',c+' '+e.message);}}
   }
   const ok=COINS.filter(c=>kd[c]&&kd[c].c).length;
-  log('RESULT',ok+'/'+COINS.length+(fail.length?' 失败:'+fail.join(','):''));
-  await kvW('data_b',{ts:Date.now(),d:kd});
+  log('DATA_B_END','success='+ok+'/'+COINS.length+' failed='+fail.length+' total_time='+((Date.now()-st)/1000).toFixed(1)+'秒');
+  // KV写入日志
+  log('KV_WRITE_START','key=data_b');
+  const kvData={ts:Date.now(),d:kd};
+  await kvW('data_b',kvData);
+  const kvSize=JSON.stringify(kvData).length;
+  log('KV_WRITE_OK','timestamp='+new Date(kvData.ts).toISOString()+' size='+kvSize+'bytes');
   log('END','耗时'+(Date.now()-st)+'ms');
   return 'DATA-B '+ok+'/'+COINS.length+' '+(Date.now()-st)+'ms';
 }
