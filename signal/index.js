@@ -1,5 +1,5 @@
-// V1-SIGNAL-1.1 — 读KV + 时间戳检查 + /health
-const CFG={S1:[6,1.0],S2:[10,2.5],S3:[14,5.0],TP:5,MR:3,VOL_FILTER:0.5,VERSION:'SIGNAL-1.1',
+// V1-SIGNAL-1.2 — 读KV + ready检测 + /health + /testdebug
+const CFG={S1:[6,1.0],S2:[10,2.5],S3:[14,5.0],TP:5,MR:3,VOL_FILTER:0.5,VERSION:'SIGNAL-1.2',
   TOKEN:typeof PUSHPLUS_TOKEN!=='undefined'?PUSHPLUS_TOKEN:'',
   BACKUP:['BTC','ETH','SOL','XRP','DOGE','BNB','ADA','AVAX','LINK','BCH','LTC','ZEC',
     'SUI','TAO','XLM','NEAR','WLD','INJ','FIL','HBAR','TRX','ONDO','ENA','UNI',
@@ -58,10 +58,17 @@ async function run(sch){
   const keys=['data_a','data_b','data_c'];
   const kd={};let tsInfo={},expired=[],rawKvs={};
   for(const key of keys){
-    const v=await kvR(key);
+    let v=await kvR(key);
+    // D: KV ready状态检查 — 等待数据写入完成
+    for(let w=0;w<5;w++){
+      if(v&&v.status==='ready')break;
+      log('KV_WAIT',key+' status='+(v?v.status:'null')+' 等待1s ('+(w+1)+'/5)');
+      await new Promise(r=>setTimeout(r,1000));
+      v=await kvR(key);
+    }
     rawKvs[key]=v;
     log('KV_READ',key+':');
-    if(v&&v.d){
+    if(v&&v.status==='ready'&&v.d){
       const cCount=Object.keys(v.d).length;
       const ageS=Math.round((Date.now()-v.ts)/1000);
       log('KV_READ','  exists=true age='+ageS+'秒 coins='+cCount);
@@ -69,7 +76,7 @@ async function run(sch){
       tsInfo[key]={ts:v.ts,age:Date.now()-v.ts};
       if(Date.now()-v.ts>4.5*3600000)expired.push(key);
     }else{
-      log('KV_READ','  MISSING');
+      log('KV_READ','  MISSING'+(v?' status='+v.status:''));
       tsInfo[key]={ts:0,age:-1};expired.push(key);
     }
   }
