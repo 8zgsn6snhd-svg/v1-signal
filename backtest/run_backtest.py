@@ -29,6 +29,7 @@ def run_version(name, all_coins, pool_mode):
     t0 = time.time()
 
     # 构建滚动池 provider
+    fixed_base = [c for c in fixed_pool(all_coins)]
     def make_provider(mode):
         cache = {}
         def provider(bi, ts, current_pool):
@@ -37,12 +38,16 @@ def run_version(name, all_coins, pool_mode):
             if day_key in cache:
                 return cache[day_key]
             if mode == 'fixed':
-                pool = fixed_pool(all_coins)
+                pool = fixed_base
             elif mode == 'dynamic':
                 pool = dynamic_pool(all_coins, ts, top_n=33)
+                # 池子不足(早期)时用固定池兜底, 保证始终有33币且不滥用全市场
+                if pool is None or len(pool) < 20:
+                    pool = fixed_base
             else:
-                base = fixed_pool(all_coins)
-                pool = hybrid_pool(all_coins, ts, base, top_n=33)
+                pool = hybrid_pool(all_coins, ts, fixed_base, top_n=33)
+                if pool is None or len(pool) < 20:
+                    pool = fixed_base
             cache[day_key] = pool
             return pool
         return provider

@@ -9,6 +9,19 @@ import os, json, pickle, datetime
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), '..', 'data')
 
+# 币上市时间 (来自OKX合约listTime, 下载数据时保存)
+_LISTTIME = None
+def _get_listtime():
+    global _LISTTIME
+    if _LISTTIME is None:
+        p = os.path.join(DATA_DIR, 'listtime.json')
+        if os.path.exists(p):
+            with open(p) as f:
+                _LISTTIME = json.load(f)
+        else:
+            _LISTTIME = {}
+    return _LISTTIME
+
 # 生产固定33池 (v1_final_spec.md 冻结) — 用OKX能拉到合约数据的
 FROZEN_33 = ['BTC', 'ETH', 'SOL', 'XRP', 'DOGE', 'BNB', 'ADA', 'AVAX', 'LINK',
              'BCH', 'LTC', 'ZEC', 'SUI', 'TAO', 'XLM', 'NEAR', 'WLD', 'INJ',
@@ -27,7 +40,7 @@ def load_coin(sym):
     d = {
         'h': [b[2] for b in bars], 'l': [b[3] for b in bars],
         'c': [b[4] for b in bars], 'v': [b[5] for b in bars],
-        't': [b[0] for b in bars]
+        't': [b[0] for b in bars], '_sym': sym
     }
     return d
 
@@ -65,16 +78,22 @@ def compute_vol_liquidity(d, start_ts):
     return vol_avg, liq
 
 def listed_before(d, start_ts, min_years=1.0):
-    """检查该币数据在start_ts前是否足够 (上市>1年 = 至少min_years*365*6根4H)"""
-    ts = d['t']
-    earliest = ts[0] if ts else None
-    if earliest is None:
-        return False
-    # 数据最早时间距start_ts是否>1年
-    return (start_ts - earliest) >= min_years * 365 * 24 * 3600 * 1000
+    """检查该币在start_ts时刻是否已上市>=min_years年
+    用OKX合约listTime(币上市时间)判断"""
+    sym = d.get('_sym', '')
+    lt = _get_listtime().get(sym)
+    if not lt:
+        # 无listTime, 用数据起点近似
+        ts = d['t']
+        earliest = ts[0] if ts else None
+        if earliest is None:
+            return False
+        lt = earliest
+    return (start_ts - lt) >= min_years * 365 * 24 * 3600 * 1000
 
 def dynamic_pool(all_coins, start_ts, top_n=33, min_years=1.0):
-    """动态池: 全市场 -> 上市>1年 -> 成交量过滤(>全市场P30) -> 流动性排序Top33"""
+    """动态池: 全市场 -> 上市>1年(OKX listTime) -> 成交量过滤 -> 流动性排序Top33
+    若池子为空(回测早期), 返回None让engine回退, 避免全市场乱开仓."""
     candidates = []
     for sym, d in all_coins.items():
         if not listed_before(d, start_ts, min_years):

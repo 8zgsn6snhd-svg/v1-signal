@@ -24,6 +24,7 @@ TIMEOUT_BARS = 240
 MAX_POS = 3
 RISK_PER_TRADE = 0.01
 MAX_POS_PCT = 0.50
+BAR_MS = 4 * 3600 * 1000   # 4H bar时长
 FEES = 0.0005      # 单边 0.05% 手续费
 SLIPPAGE = 0.0003  # 单边 0.03% 滑点
 
@@ -151,16 +152,14 @@ class V1Backtest:
         return hi
 
     def _find_signal(self, sym, ts):
-        """ts处该币是否C信号+过滤, 返回详情或None"""
+        """在ts时刻(刚收盘bar)检查该币是否C信号+过滤, 返回详情或None
+        ts为"收盘时刻", 判定用 ts-BAR_MS 开盘的那根bar (已完整收盘, 无前瞻)"""
         c = self.coins[sym]
-        idx = self._c_idx(sym, ts)
+        idx = self._c_idx(sym, ts - BAR_MS)
         if idx is None or idx < 1 or idx >= c.n - 1:
             return None
-        # 必须是 ts 恰好对应这根bar的收盘确认 (用同bar判定)
-        # 生产: 用 ix=c.length-2 (倒数第二根) 即"已收盘bar"
-        # 这里 idx 是最接近ts的bar, 若ts正好是该bar开盘则信号未确认, 跳过
-        if c.ts[idx] != ts:
-            return None
+        if c.ts[idx] != ts - BAR_MS:
+            return None  # 该币此bar无数据
         if not c.c_signal(idx):
             return None
         if not c.vol_ok(idx):
@@ -168,56 +167,66 @@ class V1Backtest:
         dist = c.st_dist(idx)
         if dist > ST_DIST_MAX:
             return None
-        direction = -1 if c.trends[0][idx] == -1 else 1  # dr=-1=多, dr=1=空
-        entry_price = c.close[idx]
+        direction = 1 if c.trends[0][idx] == -1 else -1  # dr=-1=多头(绿), dr=1=空头(红)
+        entry_price = c.close[idx]   # 信号bar收盘价 = 当前已知价格
         stop = c.lines[0][idx]
         return {'sym': sym, 'dir': direction, 'entry': entry_price,
                 'stop': stop, 'dist': dist, 'idx': idx}
 
     def run(self):
         """主循环: 逐bar扫描当前池币, 找C信号; 管理持仓退出"""
+        # 初始池: 若有provider, 先求第一天池子; 否则全市场
         self.current_pool = list(self.coins.keys())
+        if self.pool_provider is not None:
+            p0 = self.pool_provider(0, self.timeline[0], self.current_pool)
+            if p0 is not None and len(p0) > 0:
+                self.current_pool = p0
         for bi, ts in enumerate(self.timeline):
-            if self.pool_provider is not None and bi % self.pool_update_bars == 0:
+            if self.pool_provider is not None and bi > 0 and bi % self.pool_update_bars == 0:
                 new_pool = self.pool_provider(bi, ts, self.current_pool)
                 if new_pool is not None and len(new_pool) > 0:
                     self.current_pool = new_pool
 
-            # 1. 持仓退出检查
+            # 1. 持仓退出检查 (用 ts-BAR_MS 刚收盘bar, 无前瞻)
             for sym in list(self.positions.keys()):
                 pos = self.positions[sym]
                 c = self.coins[sym]
-                idx = self._c_idx(sym, ts)
-                if idx is None or c.ts[idx] != ts:
+                idx = self._c_idx(sym, ts - BAR_MS)
+                if idx is None or c.ts[idx] != ts - BAR_MS:
                     continue  # 该币此bar无数据, 跳过
                 pos['bars_held'] += 1
                 if pos['bars_held'] >= TIMEOUT_BARS:
                     self._close(sym, c.close[idx], 'TIMEOUT', ts, idx)
                     continue
                 cur_close = c.close[idx]
-                if pos['dir'] == 1 and cur_close < pos['stop']:
-                    self._close(sym, pos['stop'], 'STOP', ts, idx)
-                    continue
-                if pos['dir'] == -1 and cur_close > pos['stop']:
-                    self._close(sym, pos['stop'], 'STOP', ts, idx)
-                    continue
+                cur_dir = c.trends[0][idx]
+                prev_dir = c.trends[0][idx - 1] if idx > 0 else cur_dir
                 R = abs(pos['entry'] - pos['stop'])
+                # 止盈优先: 5R
                 if pos['dir'] == 1 and cur_close >= pos['entry'] + TP_R * R:
                     self._close(sym, pos['entry'] + TP_R * R, 'TP', ts, idx)
                     continue
                 if pos['dir'] == -1 and cur_close <= pos['entry'] - TP_R * R:
                     self._close(sym, pos['entry'] - TP_R * R, 'TP', ts, idx)
                     continue
+                # 止损 = ST1方向翻转, 成交价 = 前一根bar的ST1线(价格穿越触发位)
+                # 多头: 前绿bar的lower band; 空头: 前红bar的upper band
+                if pos['dir'] == 1 and prev_dir == -1 and cur_dir == 1:
+                    self._close(sym, c.lines[0][idx - 1], 'STOP', ts, idx)
+                    continue
+                if pos['dir'] == -1 and prev_dir == 1 and cur_dir == -1:
+                    self._close(sym, c.lines[0][idx - 1], 'STOP', ts, idx)
+                    continue
 
-            # 2. BTC反色平仓: ST1 绿->红 (dr -1 -> 1)
+            # 2. BTC反色平仓: ST1 绿->红 (dr -1 -> 1) 只平仓不禁入
             if 'BTC' in self.coins and self.positions:
                 btc = self.coins['BTC']
-                idx = self._c_idx('BTC', ts)
-                if idx is not None and idx >= 1 and btc.ts[idx] == ts:
+                idx = self._c_idx('BTC', ts - BAR_MS)
+                if idx is not None and idx >= 1 and btc.ts[idx] == ts - BAR_MS:
                     if btc.trends[0][idx - 1] == -1 and btc.trends[0][idx] == 1:
                         for sym in list(self.positions.keys()):
-                            ci = self._c_idx(sym, ts)
-                            if ci is not None and self.coins[sym].ts[ci] == ts:
+                            ci = self._c_idx(sym, ts - BAR_MS)
+                            if ci is not None and self.coins[sym].ts[ci] == ts - BAR_MS:
                                 self._close(sym, self.coins[sym].close[ci], 'BTC_REV', ts, ci)
 
             # 3. 新开仓 (时间优先, 满仓锁定, 只扫当前池)
@@ -237,11 +246,11 @@ class V1Backtest:
                         continue
                     self._open(sig, ts)
 
-            # 4. 更新权益
+            # 4. 更新权益 (用 ts-BAR_MS 刚收盘bar)
             eq = self.balance
             for sym, pos in self.positions.items():
                 c = self.coins[sym]
-                idx = self._c_idx(sym, ts)
+                idx = self._c_idx(sym, ts - BAR_MS)
                 if idx is not None:
                     pnl = pos['dir'] * (c.close[idx] - pos['entry']) / pos['entry'] * pos['qty']
                     eq += pnl
@@ -283,8 +292,10 @@ class V1Backtest:
         })
 
     def close_all(self):
-        """结束时平所有仓"""
+        """结束时平所有仓, 用回测窗口末尾对应的bar (不能用数据最后一根)"""
         for sym in list(self.positions.keys()):
             c = self.coins[sym]
-            idx = len(c.ts) - 1
+            idx = self._c_idx(sym, self.timeline[-1])
+            if idx is None:
+                idx = len(c.ts) - 1
             self._close(sym, c.close[idx], 'END', self.timeline[-1], idx)
