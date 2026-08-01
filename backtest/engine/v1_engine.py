@@ -115,10 +115,13 @@ class Coin:
 
 class V1Backtest:
     def __init__(self, coins_data, start_ts, end_ts, initial=10000,
-                 pool_provider=None, pool_update_bars=1):
+                 pool_provider=None, pool_update_bars=1, fees=FEES, slippage=SLIPPAGE,
+                 delay_bars=0):
         """coins_data: dict {symbol: {h,l,c,v,t}} 已按ts升序
         pool_provider: callable(bar_index, ts, current_pool) -> list[str], 可选
-        pool_update_bars: 每N根bar重新评估池子"""
+        pool_update_bars: 每N根bar重新评估池子
+        fees/slippage: 手续费/滑点覆盖 (压力测试)
+        delay_bars: 延迟成交根数 (模拟人工确认, 默认0=信号bar收盘成交)"""
         self.coins = {}
         for sym, d in coins_data.items():
             self.coins[sym] = Coin(sym, d['h'], d['l'], d['c'], d['v'], d['t'])
@@ -136,6 +139,10 @@ class V1Backtest:
         self.balance = initial
         self.positions = {}
         self.current_pool = None
+        self.fees = fees
+        self.slippage = slippage
+        self.delay_bars = delay_bars
+        self.pending = {}
 
     def _c_idx(self, sym, ts):
         """返回该币时间轴中 <=ts 的最近 index"""
@@ -244,7 +251,30 @@ class V1Backtest:
                         break
                     if sig['sym'] in self.positions:
                         continue
-                    self._open(sig, ts)
+                    if self.delay_bars > 0:
+                        # 延迟成交: 存pending, 到delay_bars根后再成交
+                        self.pending.setdefault(ts, []).append(sig)
+                    else:
+                        self._open(sig, ts)
+
+            # 5. 延迟成交: 处理到期的pending信号 (delay_bars>0时)
+            if self.delay_bars > 0 and bi >= self.delay_bars:
+                due_ts = self.timeline[bi - self.delay_bars]
+                pendings = self.pending.get(due_ts, [])
+                for sig in pendings:
+                    if len(self.positions) >= MAX_POS:
+                        break
+                    if sig['sym'] in self.positions:
+                        continue
+                    # 用延迟后的开盘价成交 (ts处刚收盘bar的开盘)
+                    c = self.coins[sig['sym']]
+                    idx = self._c_idx(sig['sym'], ts - BAR_MS)
+                    if idx is None or c.ts[idx] != ts - BAR_MS:
+                        continue
+                    sig2 = dict(sig)
+                    sig2['entry'] = c.close[idx]  # 用延迟bar收盘近似开盘
+                    self._open(sig2, ts)
+                self.pending.pop(due_ts, None)
 
             # 4. 更新权益 (用 ts-BAR_MS 刚收盘bar)
             eq = self.balance
@@ -280,7 +310,7 @@ class V1Backtest:
         pos = self.positions.pop(sym)
         if exit_price is None:
             exit_price = self.coins[sym].close[idx]
-        ret = pos['dir'] * (exit_price - pos['entry']) / pos['entry'] - FEES * 2 - SLIPPAGE * 2
+        ret = pos['dir'] * (exit_price - pos['entry']) / pos['entry'] - self.fees * 2 - self.slippage * 2
         pnl = ret * pos['qty']
         self.balance += pnl
         self.trades.append({
