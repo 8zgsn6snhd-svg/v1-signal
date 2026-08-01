@@ -1,12 +1,40 @@
-// V1-DATA-A-1.3 — A组(错峰+01min) 500ms间隔 + 单币3次重试(1s/3s/8s) + 失败分类
-const COINS=['BTC','ETH','SOL','XRP','DOGE','BNB','ADA','AVAX','LINK','BCH','LTC','ZEC'];
+// V1-DATA-A-2.0 — 读KV pool动态拉币 + 500ms间隔 + 单币3次重试(1s/3s/8s) + 失败分类
+// 从 KV pool.coins 读动态池, 按切片分配: A取前1/3
+const POOL_KVID='7d4e8decec9849e8becab243a3d4de15';   // V1_POOL 命名空间
 const KVKEY='ohlcv_A';
 const KVID='1074343ba32f4d43be99455ff88cfecb';
 const AID='503d56d255b8bfd89e71160f3f98f8df';
 const CF_TOK=typeof CF_API_TOKEN!=='undefined'?CF_API_TOKEN:'';
 const NAME='DATA-A';
+// 固定fallback (V1.8冻结34币)
+const FIXED_COINS=['BTC','ETH','SOL','XRP','DOGE','BNB','ADA','AVAX','LINK','BCH','LTC','ZEC'];
+const SLICE_START=0, SLICE_END=11;   // A拉 0-11
+
 function log(t,m){console.log('['+NAME+']['+t+'] '+m);}
 function cls(e){const m=e&&e.message?e.message:'';if(m==='RATE_LIMIT')return'RATE_LIMIT';if(m==='TIMEOUT')return'TIMEOUT';if(m==='SYMBOL_ERROR')return'SYMBOL_ERROR';return'API_ERROR';}
+
+async function kvR(key,kvid){
+  if(!CF_TOK){log('KV','NO_CF_TOKEN');return null;}
+  try{
+    const r=await fetch('https://api.cloudflare.com/client/v4/accounts/'+AID+'/storage/kv/namespaces/'+kvid+'/values/'+key,
+      {headers:{'Authorization':'Bearer '+CF_TOK}});
+    if(!r.ok){log('KV',key+' HTTP'+r.status);return null;}
+    return await r.json();
+  }catch(e){return null;}
+}
+
+// 读动态池, 返回本组应拉的币
+async function getMyCoins(){
+  const pool=await kvR('pool',POOL_KVID);
+  if(pool&&pool.coins&&pool.coins.length>=20){
+    log('POOL','动态池 '+pool.coins.length+'币 mode='+(pool.mode||'?')+' 时间:'+pool.time);
+    const slice=pool.coins.slice(SLICE_START,SLICE_END+1);
+    log('POOL','本组拉取 '+slice.length+'币: '+slice.join(','));
+    return slice;
+  }
+  log('POOL','fallback固定池 '+FIXED_COINS.length+'币');
+  return FIXED_COINS;
+}
 
 async function okxF(path){
   const key=typeof OKX_API_KEY!=='undefined'?OKX_API_KEY:'';
@@ -61,6 +89,7 @@ async function run(){
   if(jitter>2000)log('JITTER','等待'+(jitter/1000).toFixed(1)+'秒');
   await new Promise(w=>setTimeout(w,jitter));
   const st=Date.now();log('START','');
+  const COINS=await getMyCoins();
   log('DATA_A_START','time='+new Date().toISOString());
   log('DATA_A_START','请求币数量: '+COINS.length+' 组='+KVKEY);
   const kd={};let fail=[]; // fail=[{c,reason}]

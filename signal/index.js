@@ -5,9 +5,14 @@ const CFG={S1:[6,1.0],S2:[10,2.5],S3:[14,5.0],TP:5,MR:3,VOL_FILTER:0.5,VERSION:'
     'SUI','TAO','XLM','NEAR','WLD','INJ','FIL','HBAR','TRX','ONDO','ENA','UNI',
     'HYPE','DOT','APT','ARB','OP','ATOM','NEIRO','GALA','PEPE','WIF']};
 const KVID='1074343ba32f4d43be99455ff88cfecb';
+const POOL_KVID='7d4e8decec9849e8becab243a3d4de15';
 const AID='503d56d255b8bfd89e71160f3f98f8df';
 const CF_TOK=typeof CF_API_TOKEN!=='undefined'?CF_API_TOKEN:'';
 const NAME='SIGNAL';
+// 固定fallback池 (V1.8冻结34币)
+const FIXED_POOL=['BTC','ETH','SOL','XRP','DOGE','BNB','ADA','AVAX','LINK',
+  'BCH','LTC','ZEC','SUI','TAO','XLM','NEAR','WLD','INJ','FIL','HBAR',
+  'TRX','ONDO','ENA','UNI','HYPE','DOT','APT','ARB','OP','ATOM','NEIRO','GALA','PEPE','WIF'];
 function log(t,m){console.log('['+NAME+']['+t+'] '+m);}
 
 function st(h,l,c,p,m){if(!c||c.length<p)return null;
@@ -42,9 +47,10 @@ async function pu(t,c){
     log('PUSH',(ok?'OK':'FAIL')+' code='+j.code);
     return{ok,code:j.code,msg:j.msg};
   }catch(e){log('PUSH','ERR '+e.message);return{ok:false,err:e.message};}}
-async function kvR(key){
+async function kvR(key,kvid){
   if(!CF_TOK){log('KV','NO_CF_TOKEN');return null;}
-  try{const r=await fetch('https://api.cloudflare.com/client/v4/accounts/'+AID+'/storage/kv/namespaces/'+KVID+'/values/'+key,
+  const ns=kvid||KVID;
+  try{const r=await fetch('https://api.cloudflare.com/client/v4/accounts/'+AID+'/storage/kv/namespaces/'+ns+'/values/'+key,
     {headers:{'Authorization':'Bearer '+CF_TOK}});
     if(!r.ok){log('KV',key+' HTTP'+r.status);return null;}return await r.json();
   }catch(e){return null;}}
@@ -67,8 +73,22 @@ async function run(sch){
   log('START','sch='+sch);
   const n=new Date(),ns=n.toISOString().slice(0,16).replace('T',' ');
 
-  // 读 ohlcv_A/B/C + ready检测
-  const groups=[{key:'ohlcv_A',name:'A组',expect:12},{key:'ohlcv_B',name:'B组',expect:12},{key:'ohlcv_C',name:'C组',expect:10}];
+  // 读动态池 (KV pool.coins), 决定扫描币种
+  let scanCoins=CFG.BACKUP, poolMode='fixed', poolInfo=null;
+  try{
+    const pool=await kvR('pool',POOL_KVID);
+    if(pool&&pool.coins&&pool.coins.length>=20){
+      scanCoins=pool.coins.slice(0,33);
+      poolMode=pool.mode||'dynamic';
+      poolInfo=pool;
+      log('POOL','使用动态池 '+scanCoins.length+'币 mode='+poolMode+' 时间:'+pool.time);
+    }else{
+      log('POOL','pool不可用, fallback固定池 '+scanCoins.length+'币');
+    }
+  }catch(e){log('POOL','读取失败 '+e.message+' fallback固定池');}
+
+  // 读 ohlcv_A/B/C + ready检测 (expect为参考, 动态池下每组币数可能不同)
+  const groups=[{key:'ohlcv_A',name:'A组',expect:12},{key:'ohlcv_B',name:'B组',expect:12},{key:'ohlcv_C',name:'C组',expect:9}];
   const kd={};const gInfo={};
   for(const g of groups){
     let v=await kvR(g.key);
@@ -87,9 +107,9 @@ async function run(sch){
     gInfo[g.key]={v,ok,failed,ageS,expect:g.expect};
     log('KV_READ',g.name+' '+g.key+': exists='+(v&&v.status==='ready')+' success='+ok+'/'+g.expect+' failed='+(failed.length?failed.join(','):'无')+' age='+ageS+'秒');
   }
-  const ok=CFG.BACKUP.filter(c=>kd[c]&&kd[c].c).length;
-  const missing=CFG.BACKUP.filter(c=>!kd[c]||!kd[c].c);
-  log('MERGE','total='+ok+'/34');
+  const ok=scanCoins.filter(c=>kd[c]&&kd[c].c).length;
+  const missing=scanCoins.filter(c=>!kd[c]||!kd[c].c);
+  log('MERGE','total='+ok+'/'+scanCoins.length+' pool='+poolMode);
 
   // 数据报告
   log('REPORT','========== V1 DATA REPORT ==========');
@@ -101,19 +121,29 @@ async function run(sch){
     log('REPORT','  失败: '+(gi.failed&&gi.failed.length?gi.failed.join(','):'无'));
   }
   log('REPORT','最终:');
-  log('REPORT','  '+CFG.BACKUP.length+'币 成功: '+ok+' 失败: '+(missing.length?missing.join(','):'0'));
+  log('REPORT','  '+scanCoins.length+'币('+poolMode+') 成功: '+ok+' 失败: '+(missing.length?missing.join(','):'0'));
   log('REPORT','====================================');
 
   // 保存运行状态到KV (供 /status)
-  const statusRec={last_run:ns,data:ok,failed:missing.slice(0,20),ts:Date.now()};
+  const statusRec={last_run:ns,data:ok,pool:poolMode,failed:missing.slice(0,20),ts:Date.now()};
   await kvW('signal_status',statusRec);
+
+  // 完整检查: 动态池 <30/33 自动fallback固定池
+  let usePool=scanCoins;
+  if(poolMode==='dynamic'&&ok<30){
+    log('FALLBACK','动态池数据不足 '+ok+'/'+scanCoins.length+' (<30), fallback固定池');
+    usePool=FIXED_POOL;
+    const okF=usePool.filter(c=>kd[c]&&kd[c].c).length;
+    log('FALLBACK','固定池数据 '+okF+'/'+usePool.length);
+    poolMode='fixed-fallback';
+  }
 
   // 合并阈值: <30 禁止发送交易信号
   if(ok<30){
-    log('DIAG','数据严重不足 '+ok+'/34 禁止发信号');
-    let r='⚠️ 数据不足\n成功: '+ok+'/'+CFG.BACKUP.length+'\n失败币: '+(missing.length?missing.join(','):'无')+'\n';
+    log('DIAG','数据严重不足 '+ok+'/'+scanCoins.length+' 禁止发信号');
+    let r='⚠️ 数据不足\n成功: '+ok+'/'+scanCoins.length+' ('+poolMode+')\n失败币: '+(missing.length?missing.join(','):'无')+'\n';
     r+='下次: '+nextRun()+'\n';
-    await pu('⚠️ V1 数据不足 '+ok+'/'+CFG.BACKUP.length,r);
+    await pu('⚠️ V1 数据不足 '+ok+'/'+scanCoins.length+' ('+poolMode+')',r);
     log('END','');
     return r;
   }
@@ -122,7 +152,7 @@ async function run(sch){
   let btcDir='';const bk=kd['BTC'];
   if(bk&&bk.c&&bk.c.length){const s3=st(bk.h,bk.l,bk.c,...CFG.S3);if(s3){const d=s3.dr[bk.c.length-2];btcDir=d===1?'S':'L';}}
   const sigs=[],nos=[];
-  for(const c of CFG.BACKUP){
+  for(const c of usePool){
     const k=kd[c];if(!k||!k.c||!k.c.length){nos.push({c});continue;}
     const p=k.c[k.c.length-1],s3=st(k.h,k.l,k.c,...CFG.S3),dir=s3?s3.dr[k.c.length-2]:0;
     const a=an(c,k.h,k.l,k.c,k.v,0);let sc=0,hs=0,Rv=0,dst=0,dm=0;
@@ -131,18 +161,18 @@ async function run(sch){
     (hs?sigs:nos).push({c,p,dir,sc,R:Rv,dst,dm});
   }
   sigs.sort((a,b)=>b.sc-a.sc);
-  log('STRATEGY','信号:'+sigs.length);
+  log('STRATEGY','信号:'+sigs.length+' pool='+poolMode);
   for(const s of sigs)log('SIGNAL',s.c+' '+(s.dir===1?'S':'L')+' 评分:'+s.sc+' R:'+s.R.toFixed(1));
 
-  const status=ok>=CFG.BACKUP.length-2?'正常':(ok>=CFG.BACKUP.length*0.7?'数据不足':'数据严重不足');
-  let r='['+CFG.VERSION+'] '+ns+(btcDir?' BTC:'+btcDir:'')+'\n';
-  r+=status+' '+ok+'/'+CFG.BACKUP.length+'\n';
+  const status=ok>=scanCoins.length-2?'正常':(ok>=scanCoins.length*0.7?'数据不足':'数据严重不足');
+  let r='['+CFG.VERSION+'] '+ns+(btcDir?' BTC:'+btcDir:'')+' ('+poolMode+')\n';
+  r+=status+' '+ok+'/'+scanCoins.length+'\n';
   if(missing.length)r+='⚠️ 缺失:'+missing.join(',')+'\n';
   if(!sigs.length)r+='无信号\n';
   for(const s of sigs)r+=s.c+' '+(s.dir===1?'S':'L')+' '+s.sc+' R:'+s.R.toFixed(1)+' d:'+s.dst.toFixed(1)+'% $'+pf(s.p)+(s.dm?' OK':'')+'\n';
   if(nos.length){r+='--\n';for(const x of nos)r+=x.c+' '+(x.dir?sd(x.dir):'?')+' '+(x.p?'$'+pf(x.p):'x')+(x.sc?' '+x.sc:'')+'\n';}
   log('PUSH','标题:'+(sigs.length?'V1 '+sigs.map(s=>s.c+(s.dir===1?'S':'L')+'R'+s.R.toFixed(1)).join(' '):'V1 '+status));
-  await pu(sigs.length?'V1 '+sigs.map(s=>s.c+(s.dir===1?'S':'L')+'R'+s.R.toFixed(1)).join(' '):'V1 '+status+' '+ok+'/'+CFG.BACKUP.length,r);
+  await pu(sigs.length?'V1 '+sigs.map(s=>s.c+(s.dir===1?'S':'L')+'R'+s.R.toFixed(1)).join(' '):'V1 '+status+' '+ok+'/'+scanCoins.length+' ('+poolMode+')',r);
   log('END','');
   return r;
 }
@@ -161,7 +191,8 @@ async function status(e){
   const j={
     status:'ok',version:CFG.VERSION,
     last_run:s?s.last_run:null,
-    data:(s?s.data:0)+'/34',
+    data:(s?s.data:0)+'/33',
+    pool:(s&&s.pool)?s.pool:'?',
     recent_failed:(s&&s.failed&&s.failed.length)?s.failed:'无',
     next_run:nextRun(),
     data_a:ka?{success:Object.keys(ka.data||{}).length,failed:ka.failed||[],age:age(ka)}:null,

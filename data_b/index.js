@@ -1,12 +1,40 @@
-// V1-DATA-B-1.3 — B组(错峰+02min) 500ms间隔 + 单币3次重试(1s/3s/8s) + 失败分类
-const COINS=['SUI','TAO','XLM','NEAR','WLD','INJ','FIL','HBAR','TRX','ONDO','ENA','UNI'];
+// V1-DATA-B-2.0 — 读KV pool动态拉币 + 500ms间隔 + 单币3次重试(1s/3s/8s) + 失败分类
+// 从 KV pool.coins 读动态池, 按切片分配: B取中1/3
+const POOL_KVID='7d4e8decec9849e8becab243a3d4de15';   // V1_POOL 命名空间
 const KVKEY='ohlcv_B';
 const KVID='1074343ba32f4d43be99455ff88cfecb';
 const AID='503d56d255b8bfd89e71160f3f98f8df';
 const CF_TOK=typeof CF_API_TOKEN!=='undefined'?CF_API_TOKEN:'';
 const NAME='DATA-B';
+// 固定fallback (V1.8冻结34币 中部)
+const FIXED_COINS=['SUI','TAO','XLM','NEAR','WLD','INJ','FIL','HBAR','TRX','ONDO','ENA','UNI'];
+const SLICE_START=12, SLICE_END=23;   // B拉 12-23
+
 function log(t,m){console.log('['+NAME+']['+t+'] '+m);}
 function cls(e){const m=e&&e.message?e.message:'';if(m==='RATE_LIMIT')return'RATE_LIMIT';if(m==='TIMEOUT')return'TIMEOUT';if(m==='SYMBOL_ERROR')return'SYMBOL_ERROR';return'API_ERROR';}
+
+async function kvR(key,kvid){
+  if(!CF_TOK){log('KV','NO_CF_TOKEN');return null;}
+  try{
+    const r=await fetch('https://api.cloudflare.com/client/v4/accounts/'+AID+'/storage/kv/namespaces/'+kvid+'/values/'+key,
+      {headers:{'Authorization':'Bearer '+CF_TOK}});
+    if(!r.ok){log('KV',key+' HTTP'+r.status);return null;}
+    return await r.json();
+  }catch(e){return null;}
+}
+
+// 读动态池, 返回本组应拉的币
+async function getMyCoins(){
+  const pool=await kvR('pool',POOL_KVID);
+  if(pool&&pool.coins&&pool.coins.length>=20){
+    log('POOL','动态池 '+pool.coins.length+'币 mode='+(pool.mode||'?')+' 时间:'+pool.time);
+    const slice=pool.coins.slice(SLICE_START,SLICE_END+1);
+    log('POOL','本组拉取 '+slice.length+'币: '+slice.join(','));
+    return slice;
+  }
+  log('POOL','fallback固定池 '+FIXED_COINS.length+'币');
+  return FIXED_COINS;
+}
 
 async function okxF(path){
   const key=typeof OKX_API_KEY!=='undefined'?OKX_API_KEY:'';
@@ -56,10 +84,12 @@ async function kvW(key,val){
   }catch(e){log('KV','PUT_FAIL:'+e.message);}
 }
 async function run(){
+  // 启动随机jitter 0-45秒
   const jitter=Math.random()*45000;
   if(jitter>2000)log('JITTER','等待'+(jitter/1000).toFixed(1)+'秒');
   await new Promise(w=>setTimeout(w,jitter));
   const st=Date.now();log('START','');
+  const COINS=await getMyCoins();
   log('DATA_B_START','time='+new Date().toISOString());
   log('DATA_B_START','请求币数量: '+COINS.length+' 组='+KVKEY);
   const kd={};let fail=[]; // fail=[{c,reason}]
@@ -86,6 +116,7 @@ async function run(){
       log('COIN_END',c+' FAILED '+reason+' error='+e.message+' time='+reqT+'ms');
       fail.push({c,reason});
     }
+    // 请求间隔 500ms + 随机100-300ms
     if(c!==COINS[COINS.length-1])await new Promise(w=>setTimeout(w,500+Math.random()*300));
   }
   // 单币独立重试 最多3轮, 间隔 1s/3s/8s
@@ -110,6 +141,7 @@ async function run(){
   }
   const ok=COINS.filter(c=>kd[c]&&kd[c].c).length;
   log('DATA_B_END','success='+ok+'/'+COINS.length+' failed='+fail.length+' total_time='+((Date.now()-st)/1000).toFixed(1)+'秒');
+  // KV写入: ohlcv_B 格式
   log('KV_WRITE_START','key='+KVKEY);
   const now=new Date();
   const kvData={status:'ready',time:now.toISOString().slice(0,16).replace('T',' '),success:ok,
