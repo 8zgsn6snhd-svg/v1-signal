@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+backtest/data/*.pkl
+backtest/data/universe.json
