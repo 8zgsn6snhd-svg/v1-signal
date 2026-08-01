@@ -1,10 +1,12 @@
-// V1-DATA-B-1.2 — OKX签名 + 429指数退避 + jitter + KV ready标记
+// V1-DATA-B-1.3 — B组(错峰+02min) 500ms间隔 + 单币3次重试(1s/3s/8s) + 失败分类
 const COINS=['SUI','TAO','XLM','NEAR','WLD','INJ','FIL','HBAR','TRX','ONDO','ENA','UNI'];
+const KVKEY='ohlcv_B';
 const KVID='1074343ba32f4d43be99455ff88cfecb';
 const AID='503d56d255b8bfd89e71160f3f98f8df';
 const CF_TOK=typeof CF_API_TOKEN!=='undefined'?CF_API_TOKEN:'';
 const NAME='DATA-B';
 function log(t,m){console.log('['+NAME+']['+t+'] '+m);}
+function cls(e){const m=e&&e.message?e.message:'';if(m==='RATE_LIMIT')return'RATE_LIMIT';if(m==='TIMEOUT')return'TIMEOUT';if(m==='SYMBOL_ERROR')return'SYMBOL_ERROR';return'API_ERROR';}
 
 async function okxF(path){
   const key=typeof OKX_API_KEY!=='undefined'?OKX_API_KEY:'';
@@ -30,14 +32,18 @@ async function okxF(path){
                  'OK-ACCESS-TIMESTAMP':ts,'OK-ACCESS-PASSPHRASE':phr},
         signal:AbortSignal.timeout(12000)});
       if(!rp.ok){
-        if(rp.status===429){lastErr=Error('H429');continue;}
-        log('HTTP',path+' '+rp.status);throw Error('H'+rp.status);
+        if(rp.status===429){lastErr=Error('RATE_LIMIT');continue;}
+        log('HTTP',path+' '+rp.status);throw Error('HTTP'+rp.status);
       }
       const j=await rp.json();
-      if(j.code!=='0'){log('CODE',path+' '+j.code+' '+j.msg);throw Error('C'+j.code);}
+      if(j.code!=='0'){
+        if(j.code==='51001')throw Error('SYMBOL_ERROR');
+        log('CODE',path+' '+j.code+' '+j.msg);throw Error('API_ERROR');
+      }
       return j.data||[];
     }catch(e){
-      if(e.message==='H429'){lastErr=e;continue;}
+      if(e.name==='TimeoutError')throw Error('TIMEOUT');
+      if(e.message==='RATE_LIMIT'){lastErr=e;continue;}
       throw e;
     }
   }
@@ -50,15 +56,14 @@ async function kvW(key,val){
   }catch(e){log('KV','PUT_FAIL:'+e.message);}
 }
 async function run(){
-  // A: 启动随机jitter 0-45秒
   const jitter=Math.random()*45000;
   if(jitter>2000)log('JITTER','等待'+(jitter/1000).toFixed(1)+'秒');
   await new Promise(w=>setTimeout(w,jitter));
   const st=Date.now();log('START','');
   log('DATA_B_START','time='+new Date().toISOString());
-  log('DATA_B_START','请求币数量: '+COINS.length);
-  const kd={};let fail=[];
-  await kvW('data_b',{status:'busy',ts:Date.now()});
+  log('DATA_B_START','请求币数量: '+COINS.length+' 组='+KVKEY);
+  const kd={};let fail=[]; // fail=[{c,reason}]
+  await kvW(KVKEY,{status:'busy',ts:Date.now()});
   for(const c of COINS){
     const reqSt=Date.now();
     log('COIN_START',c+':');
@@ -67,9 +72,8 @@ async function run(){
       const reqT=Date.now()-reqSt;
       if(!d||d.length<50){
         const len=d?d.length:0;
-        log('COIN_END',c+' FAILED');
-        log('COIN_END','  HTTP=200 OKX=0 candles='+len+' time='+reqT+'ms');
-        fail.push(c);
+        log('COIN_END',c+' FAILED EMPTY_DATA candles='+len+' time='+reqT+'ms');
+        fail.push({c,reason:'EMPTY_DATA'});
         continue;
       }
       const dr=d.reverse();
@@ -77,31 +81,42 @@ async function run(){
       const close=dr[dr.length-1]?.[4];
       log('COIN_END',c+' success HTTP=200 OKX=0 candles='+d.length+' close='+close+' time='+reqT+'ms');
     }catch(e){
+      const reason=cls(e);
       const reqT=Date.now()-reqSt;
-      log('COIN_END',c+' FAILED error='+e.message+' time='+reqT+'ms');
-      fail.push(c);
+      log('COIN_END',c+' FAILED '+reason+' error='+e.message+' time='+reqT+'ms');
+      fail.push({c,reason});
     }
-    if(c!==COINS[COINS.length-1])await new Promise(w=>setTimeout(w,200+Math.random()*400));
+    if(c!==COINS[COINS.length-1])await new Promise(w=>setTimeout(w,500+Math.random()*300));
   }
-  if(fail.length){log('RETRY','失败币:'+fail.join(','));
-    for(const c of fail){try{
-      log('RETRY_START',c);
-      await new Promise(w=>setTimeout(w,300+Math.random()*500));
-      const d=await okxF('/api/v5/market/candles?instId='+c+'-USDT-SWAP&bar=4H&limit=200');
-      if(d&&d.length>50){const dr=d.reverse();
-        kd[c]={h:dr.map(k=>+k[2]),l:dr.map(k=>+k[3]),c:dr.map(k=>+k[4]),v:dr.map(k=>+k[5]),t:dr.map(k=>+k[0])};
-        fail=fail.filter(x=>x!==c);
-        log('RETRY_OK',c+' recovered');}
-      else log('RETRY_FAIL',c+' still short bars='+(d?d.length:0));
-    }catch(e){log('RETRY_ERR',c+' '+e.message);}}
+  // 单币独立重试 最多3轮, 间隔 1s/3s/8s
+  const retryDelay=[1000,3000,8000];
+  for(let at=0;at<3;at++){
+    if(!fail.length)break;
+    log('RETRY','第'+(at+1)+'轮 失败币:'+fail.map(f=>f.c).join(','));
+    await new Promise(w=>setTimeout(w,retryDelay[at]));
+    const still=[];
+    for(const f of fail){
+      try{
+        log('RETRY_START',f.c);
+        const d=await okxF('/api/v5/market/candles?instId='+f.c+'-USDT-SWAP&bar=4H&limit=200');
+        if(d&&d.length>50){const dr=d.reverse();
+          kd[f.c]={h:dr.map(k=>+k[2]),l:dr.map(k=>+k[3]),c:dr.map(k=>+k[4]),v:dr.map(k=>+k[5]),t:dr.map(k=>+k[0])};
+          log('RETRY_OK',f.c+' recovered');
+        }else{log('RETRY_FAIL',f.c+' still short bars='+(d?d.length:0));still.push(f);}
+      }catch(e){log('RETRY_ERR',f.c+' '+e.message);still.push({c:f.c,reason:cls(e)});}
+      if(f!==fail[fail.length-1])await new Promise(w=>setTimeout(w,500+Math.random()*300));
+    }
+    fail=still;
   }
   const ok=COINS.filter(c=>kd[c]&&kd[c].c).length;
   log('DATA_B_END','success='+ok+'/'+COINS.length+' failed='+fail.length+' total_time='+((Date.now()-st)/1000).toFixed(1)+'秒');
-  log('KV_WRITE_START','key=data_b');
-  const kvData={status:'ready',ts:Date.now(),d:kd};
-  await kvW('data_b',kvData);
+  log('KV_WRITE_START','key='+KVKEY);
+  const now=new Date();
+  const kvData={status:'ready',time:now.toISOString().slice(0,16).replace('T',' '),success:ok,
+    failed:fail.map(f=>f.c),reasons:fail,data:kd,ts:Date.now()};
+  await kvW(KVKEY,kvData);
   const kvSize=JSON.stringify(kvData).length;
-  log('KV_WRITE_OK','timestamp='+new Date(kvData.ts).toISOString()+' size='+kvSize+'bytes');
+  log('KV_WRITE_OK','key='+KVKEY+' timestamp='+kvData.time+' size='+kvSize+'bytes');
   log('END','耗时'+(Date.now()-st)+'ms');
   return 'DATA-B '+ok+'/'+COINS.length+' '+(Date.now()-st)+'ms';
 }

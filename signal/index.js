@@ -1,5 +1,5 @@
-// V1-SIGNAL-1.2 — 读KV + ready检测 + /health + /testdebug
-const CFG={S1:[6,1.0],S2:[10,2.5],S3:[14,5.0],TP:5,MR:3,VOL_FILTER:0.5,VERSION:'SIGNAL-1.2',
+// V1-SIGNAL-1.3 — 读ohlcv_A/B/C + 合并阈值 + 数据报告 + /status (策略逻辑不变)
+const CFG={S1:[6,1.0],S2:[10,2.5],S3:[14,5.0],TP:5,MR:3,VOL_FILTER:0.5,VERSION:'SIGNAL-1.3',
   TOKEN:typeof PUSHPLUS_TOKEN!=='undefined'?PUSHPLUS_TOKEN:'',
   BACKUP:['BTC','ETH','SOL','XRP','DOGE','BNB','ADA','AVAX','LINK','BCH','LTC','ZEC',
     'SUI','TAO','XLM','NEAR','WLD','INJ','FIL','HBAR','TRX','ONDO','ENA','UNI',
@@ -48,42 +48,77 @@ async function kvR(key){
     {headers:{'Authorization':'Bearer '+CF_TOK}});
     if(!r.ok){log('KV',key+' HTTP'+r.status);return null;}return await r.json();
   }catch(e){return null;}}
+async function kvW(key,val){
+  if(!CF_TOK){log('KV','NO_CF_TOKEN');return;}
+  try{await fetch('https://api.cloudflare.com/client/v4/accounts/'+AID+'/storage/kv/namespaces/'+KVID+'/values/'+key,
+    {method:'PUT',headers:{'Authorization':'Bearer '+CF_TOK,'Content-Type':'application/json'},body:JSON.stringify(val)});
+  }catch(e){log('KV','PUT_FAIL:'+e.message);}
+}
+function nextRun(){
+  const n=new Date();
+  for(let i=1;i<=25;i++){
+    const t=new Date(n.getTime()+i*3600000);
+    if(t.getUTCHours()%4===0){t.setUTCMinutes(4,0,0);return t.toISOString().slice(11,16);}
+  }
+  return '?';
+}
 
 async function run(sch){
   log('START','sch='+sch);
   const n=new Date(),ns=n.toISOString().slice(0,16).replace('T',' ');
-  if(sch)try{await pu('['+CFG.VERSION+']',ns);}catch(e){}
 
-  // 读KV + 时间戳检查 + 诊断日志
-  const keys=['data_a','data_b','data_c'];
-  const kd={};let tsInfo={},expired=[],rawKvs={};
-  for(const key of keys){
-    let v=await kvR(key);
-    // D: KV ready状态检查 — 等待数据写入完成
+  // 读 ohlcv_A/B/C + ready检测
+  const groups=[{key:'ohlcv_A',name:'A组',expect:12},{key:'ohlcv_B',name:'B组',expect:12},{key:'ohlcv_C',name:'C组',expect:10}];
+  const kd={};const gInfo={};
+  for(const g of groups){
+    let v=await kvR(g.key);
     for(let w=0;w<5;w++){
       if(v&&v.status==='ready')break;
-      log('KV_WAIT',key+' status='+(v?v.status:'null')+' 等待1s ('+(w+1)+'/5)');
+      log('KV_WAIT',g.key+' status='+(v?v.status:'null')+' 等待1s ('+(w+1)+'/5)');
       await new Promise(r=>setTimeout(r,1000));
-      v=await kvR(key);
+      v=await kvR(g.key);
     }
-    rawKvs[key]=v;
-    log('KV_READ',key+':');
-    if(v&&v.status==='ready'&&v.d){
-      const cCount=Object.keys(v.d).length;
-      const ageS=Math.round((Date.now()-v.ts)/1000);
-      log('KV_READ','  exists=true age='+ageS+'秒 coins='+cCount);
-      Object.assign(kd,v.d);
-      tsInfo[key]={ts:v.ts,age:Date.now()-v.ts};
-      if(Date.now()-v.ts>4.5*3600000)expired.push(key);
-    }else{
-      log('KV_READ','  MISSING'+(v?' status='+v.status:''));
-      tsInfo[key]={ts:0,age:-1};expired.push(key);
+    let ok=0,failed=[],ageS=-1;
+    if(v&&v.status==='ready'&&v.data){
+      const dd=v.data;ok=Object.keys(dd).length;failed=v.failed||[];
+      ageS=Math.round((Date.now()-v.ts)/1000);
+      Object.assign(kd,dd);
     }
+    gInfo[g.key]={v,ok,failed,ageS,expect:g.expect};
+    log('KV_READ',g.name+' '+g.key+': exists='+(v&&v.status==='ready')+' success='+ok+'/'+g.expect+' failed='+(failed.length?failed.join(','):'无')+' age='+ageS+'秒');
   }
   const ok=CFG.BACKUP.filter(c=>kd[c]&&kd[c].c).length;
+  const missing=CFG.BACKUP.filter(c=>!kd[c]||!kd[c].c);
   log('MERGE','total='+ok+'/34');
-  if(expired.length)log('WARN','数据过期:'+expired.join(','));
 
+  // 数据报告
+  log('REPORT','========== V1 DATA REPORT ==========');
+  for(const g of groups){
+    const gi=gInfo[g.key];
+    const okc=gi.ok||0;
+    log('REPORT',g.name+':');
+    log('REPORT','  成功: '+okc+'/'+gi.expect);
+    log('REPORT','  失败: '+(gi.failed&&gi.failed.length?gi.failed.join(','):'无'));
+  }
+  log('REPORT','最终:');
+  log('REPORT','  '+CFG.BACKUP.length+'币 成功: '+ok+' 失败: '+(missing.length?missing.join(','):'0'));
+  log('REPORT','====================================');
+
+  // 保存运行状态到KV (供 /status)
+  const statusRec={last_run:ns,data:ok,failed:missing.slice(0,20),ts:Date.now()};
+  await kvW('signal_status',statusRec);
+
+  // 合并阈值: <30 禁止发送交易信号
+  if(ok<30){
+    log('DIAG','数据严重不足 '+ok+'/34 禁止发信号');
+    let r='⚠️ 数据不足\n成功: '+ok+'/'+CFG.BACKUP.length+'\n失败币: '+(missing.length?missing.join(','):'无')+'\n';
+    r+='下次: '+nextRun()+'\n';
+    await pu('⚠️ V1 数据不足 '+ok+'/'+CFG.BACKUP.length,r);
+    log('END','');
+    return r;
+  }
+
+  // ===== 以下为 V1 策略逻辑(冻结,不改) =====
   let btcDir='';const bk=kd['BTC'];
   if(bk&&bk.c&&bk.c.length){const s3=st(bk.h,bk.l,bk.c,...CFG.S3);if(s3){const d=s3.dr[bk.c.length-2];btcDir=d===1?'S':'L';}}
   const sigs=[],nos=[];
@@ -99,32 +134,10 @@ async function run(sch){
   log('STRATEGY','信号:'+sigs.length);
   for(const s of sigs)log('SIGNAL',s.c+' '+(s.dir===1?'S':'L')+' 评分:'+s.sc+' R:'+s.R.toFixed(1));
 
-  // 诊断报告
-  if(ok<CFG.BACKUP.length-2){
-    log('DIAG','=== 数据不足原因 ===');
-    const kvA=rawKvs.data_a, kvB=rawKvs.data_b, kvC=rawKvs.data_c;
-    const aOk=kvA&&kvA.d?Object.keys(kvA.d).length:0;
-    const bOk=kvB&&kvB.d?Object.keys(kvB.d).length:0;
-    const cOk=kvC&&kvC.d?Object.keys(kvC.d).length:0;
-    if(!kvA||!kvA.d)log('DIAG','KV缺失: data_a不存在');
-    else if(aOk<12)log('DIAG','DATA不足: data_a '+aOk+'/12');
-    if(!kvB||!kvB.d)log('DIAG','KV缺失: data_b不存在');
-    else if(bOk<12)log('DIAG','DATA不足: data_b '+bOk+'/12');
-    if(!kvC||!kvC.d)log('DIAG','KV缺失: data_c不存在');
-    else if(cOk<10)log('DIAG','DATA不足: data_c '+cOk+'/10');
-    for(const e of expired){
-      const info=tsInfo[e];
-      const ageS=info&&info.age>0?Math.round(info.age/1000):'?';
-      log('DIAG','数据过期: '+e+' age='+ageS+'秒');
-    }
-    const missing=CFG.BACKUP.filter(c=>!kd[c]||!kd[c].c);
-    if(missing.length)log('DIAG','缺失币种('+missing.length+'): '+missing.join(','));
-  }
-
   const status=ok>=CFG.BACKUP.length-2?'正常':(ok>=CFG.BACKUP.length*0.7?'数据不足':'数据严重不足');
   let r='['+CFG.VERSION+'] '+ns+(btcDir?' BTC:'+btcDir:'')+'\n';
   r+=status+' '+ok+'/'+CFG.BACKUP.length+'\n';
-  if(expired.length)r+='⚠️ 数据过期:'+expired.join(',')+'\n';
+  if(missing.length)r+='⚠️ 缺失:'+missing.join(',')+'\n';
   if(!sigs.length)r+='无信号\n';
   for(const s of sigs)r+=s.c+' '+(s.dir===1?'S':'L')+' '+s.sc+' R:'+s.R.toFixed(1)+' d:'+s.dst.toFixed(1)+'% $'+pf(s.p)+(s.dm?' OK':'')+'\n';
   if(nos.length){r+='--\n';for(const x of nos)r+=x.c+' '+(x.dir?sd(x.dir):'?')+' '+(x.p?'$'+pf(x.p):'x')+(x.sc?' '+x.sc:'')+'\n';}
@@ -134,25 +147,38 @@ async function run(sch){
   return r;
 }
 async function health(e){
-  const ka=await kvR('data_a');const kb=await kvR('data_b');const kc=await kvR('data_c');
-  const a=ka&&ka.d?Object.keys(ka.d).length:0;
-  const b=kb&&kb.d?Object.keys(kb.d).length:0;
-  const c=kc&&kc.d?Object.keys(kc.d).length:0;
+  const ka=await kvR('ohlcv_A');const kb=await kvR('ohlcv_B');const kc=await kvR('ohlcv_C');
+  const a=ka&&ka.data?Object.keys(ka.data).length:0;
+  const b=kb&&kb.data?Object.keys(kb.data).length:0;
+  const c=kc&&kc.data?Object.keys(kc.data).length:0;
   const j={status:'ok',data_a:a+'/12',data_b:b+'/12',data_c:c+'/10',okx_key:typeof OKX_API_KEY!=='undefined'?'✅':'❌'};
   return new Response(JSON.stringify(j),{headers:{'Content-Type':'application/json'}});
 }
-async function testDebug(e){
-  const ka=await kvR('data_a');const kb=await kvR('data_b');const kc=await kvR('data_c');
-  const a=ka&&ka.d?Object.keys(ka.d).length:0;
-  const b=kb&&kb.d?Object.keys(kb.d).length:0;
-  const c=kc&&kc.d?Object.keys(kc.d).length:0;
-  const ageA=ka?Math.round((Date.now()-ka.ts)/1000):-1;
-  const ageB=kb?Math.round((Date.now()-kb.ts)/1000):-1;
-  const ageC=kc?Math.round((Date.now()-kc.ts)/1000):-1;
+async function status(e){
+  const s=await kvR('signal_status');
+  const ka=await kvR('ohlcv_A');const kb=await kvR('ohlcv_B');const kc=await kvR('ohlcv_C');
+  const age=(v)=>v?Math.round((Date.now()-v.ts)/1000)+'s':'-';
   const j={
-    data_a:{success:a,failed:12-a,age:ageA+'s',ts:ka?new Date(ka.ts).toISOString():null},
-    data_b:{success:b,failed:12-b,age:ageB+'s',ts:kb?new Date(kb.ts).toISOString():null},
-    data_c:{success:c,failed:10-c,age:ageC+'s',ts:kc?new Date(kc.ts).toISOString():null},
+    status:'ok',version:CFG.VERSION,
+    last_run:s?s.last_run:null,
+    data:(s?s.data:0)+'/34',
+    recent_failed:(s&&s.failed&&s.failed.length)?s.failed:'无',
+    next_run:nextRun(),
+    data_a:ka?{success:Object.keys(ka.data||{}).length,failed:ka.failed||[],age:age(ka)}:null,
+    data_b:kb?{success:Object.keys(kb.data||{}).length,failed:kb.failed||[],age:age(kb)}:null,
+    data_c:kc?{success:Object.keys(kc.data||{}).length,failed:kc.failed||[],age:age(kc)}:null
+  };
+  return new Response(JSON.stringify(j),{headers:{'Content-Type':'application/json'}});
+}
+async function testDebug(e){
+  const ka=await kvR('ohlcv_A');const kb=await kvR('ohlcv_B');const kc=await kvR('ohlcv_C');
+  const a=ka&&ka.data?Object.keys(ka.data).length:0;
+  const b=kb&&kb.data?Object.keys(kb.data).length:0;
+  const c=kc&&kc.data?Object.keys(kc.data).length:0;
+  const j={
+    data_a:{success:a,failed:12-a,age:ka?Math.round((Date.now()-ka.ts)/1000)+'s':'-',failedList:ka?ka.failed:[]},
+    data_b:{success:b,failed:12-b,age:kb?Math.round((Date.now()-kb.ts)/1000)+'s':'-',failedList:kb?kb.failed:[]},
+    data_c:{success:c,failed:10-c,age:kc?Math.round((Date.now()-kc.ts)/1000)+'s':'-',failedList:kc?kc.failed:[]},
     merge:{total:a+b+c,expected:34},
     kv_token:CF_TOK?'✅':'❌',
     push_token:CFG.TOKEN?'✅':'❌',
@@ -162,6 +188,7 @@ async function testDebug(e){
 }
 addEventListener('fetch',e=>{const u=new URL(e.request.url);
   if(u.pathname==='/health')return e.respondWith(health(e));
+  if(u.pathname==='/status')return e.respondWith(status(e));
   if(u.pathname==='/testdebug')return e.respondWith(testDebug(e));
   if(u.pathname==='/testpush'){const ts=new Date().toISOString().slice(0,19).replace('T',' ');
     return e.respondWith(pu('['+CFG.VERSION+'] TEST '+ts,'诊断推送<br>时间:'+ts+'<br>Token:'+(CFG.TOKEN?'已配置':'缺失')).then(r=>new Response('OK code='+r.code)));
