@@ -193,14 +193,14 @@ async function run(sch){
   for(const s of sigs)log('SIGNAL',s.c+' '+(s.dir===1?'S':'L')+' 评分:'+s.sc+' wbtc:'+s.wbtc+' R:'+s.R.toFixed(1));
 
   const status=ok>=scanCoins.length-2?'正常':(ok>=scanCoins.length*0.7?'数据不足':'数据严重不足');
-  let r='['+CFG.VERSION+'] '+ns+(btcDir?' BTC:'+btcDir:'')+' ('+poolMode+')\n';
-  r+=status+' '+ok+'/'+scanCoins.length+'\n';
-  if(missing.length)r+='⚠️ 缺失:'+missing.join(',')+'\n';
-  if(!sigs.length)r+='无信号\n';
-  for(const s of sigs)r+=s.c+' '+(s.dir===1?'S':'L')+' '+s.sc+' R:'+s.R.toFixed(1)+' d:'+s.dst.toFixed(1)+'% $'+pf(s.p)+' w:'+s.wbtc+(s.dm?' OK':'')+'\n';
-  if(nos.length){r+='--\n';for(const x of nos)r+=x.c+' '+(x.dir?sd(x.dir):'?')+' '+(x.p?'$'+pf(x.p):'x')+(x.sc?' '+x.sc:'')+(x.wbtc?' w:'+x.wbtc:'')+'\n';}
-  log('PUSH','标题:'+(sigs.length?'V1 '+sigs.map(s=>s.c+(s.dir===1?'S':'L')+'R'+s.R.toFixed(1)).join(' '):'V1 '+status));
-  await pu(sigs.length?'V1 '+sigs.map(s=>s.c+(s.dir===1?'S':'L')+'R'+s.R.toFixed(1)).join(' '):'V1 '+status+' '+ok+'/'+scanCoins.length+' ('+poolMode+')',r);
+  // V1.6 推送显示优化: 只改显示格式, 策略/评分/过滤逻辑不变
+  const dn=(d)=>d===1?'SHORT':'LONG';
+  let r='BTC:'+(btcDir||'?')+'\n\n';
+  if(missing.length)r+='⚠️ 缺失:'+missing.join(',')+'\n\n';
+  if(!sigs.length)r+='无信号 '+status+' '+ok+'/'+scanCoins.length+'\n';
+  for(const s of sigs)r+=s.c+' '+dn(s.dir)+'\nW:'+s.wbtc+'\n\n';
+  log('PUSH','V1.6 WBTC SIGNAL '+(sigs.length?sigs.map(s=>s.c+' '+dn(s.dir)+' W:'+s.wbtc).join(' '):'无信号 '+status));
+  await pu('V1.6 WBTC SIGNAL',r);
   log('END','');
   return r;
 }
