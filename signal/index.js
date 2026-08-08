@@ -1,5 +1,5 @@
-// V1-SIGNAL-1.3 — 读ohlcv_A/B/C + 合并阈值 + 数据报告 + /status (策略逻辑不变)
-const CFG={S1:[6,1.0],S2:[10,2.5],S3:[14,5.0],TP:5,MR:3,VOL_FILTER:0.5,VERSION:'SIGNAL-1.3',
+// V1-SIGNAL-1.4 — V1.6 W_btc 信号质量评分门禁 (追加, 策略逻辑不变)
+const CFG={S1:[6,1.0],S2:[10,2.5],S3:[14,5.0],TP:5,MR:3,VOL_FILTER:0.5,VERSION:'SIGNAL-1.4',
   TOKEN:typeof PUSHPLUS_TOKEN!=='undefined'?PUSHPLUS_TOKEN:'',
   BACKUP:['BTC','ETH','SOL','XRP','DOGE','BNB','ADA','AVAX','LINK','BCH','LTC','ZEC',
     'SUI','TAO','XLM','NEAR','WLD','INJ','FIL','HBAR','TRX','ONDO','ENA','UNI',
@@ -27,6 +27,30 @@ function st(h,l,c,p,m){if(!c||c.length<p)return null;
     const x=Math.abs(ln[i-1]-up[i-1])<Math.abs(ln[i-1]-lo[i-1]);
     dr[i]=x?(c[i]>up[i]?-1:1):(c[i]<lo[i]?1:-1);ln[i]=dr[i]===-1?lo[i]:up[i];}
   return{ln,dr};}
+// ===== V1.6 W_btc 信号质量评分 (与回测 ScoreFilter 一致, 阈值60) =====
+function ema(arr,p){const n=arr.length,out=Array(n).fill(0);
+  if(n<p)return out;const k=2/(p+1);let s=0;
+  for(let i=0;i<p;i++)s+=arr[i];out[p-1]=s/p;
+  for(let i=p;i<n;i++)out[i]=arr[i]*k+out[i-1]*(1-k);
+  return out;}
+function macd(arr){const e12=ema(arr,12),e26=ema(arr,26);
+  return e12.map((v,i)=>v-e26[i]);}
+// 5因子: BTC ST1同向+30 / 量>90均量+20 / ST1距离扩大+20 / EMA60同向+20 / MACD同号+10
+// dir: 生产方向(1=S空/-1=L多, 即ST dr原值); btcST1: BTC ST1的dr原值
+function wbscore(dir,ix,k,s1,btcST1){
+  let s=0;
+  if(btcST1!==0&&btcST1===dir)s+=30;                    // BTC ST1同向 +30
+  const px=k.c[ix],cv=k.v[ix];
+  if(ix>=90){let av=0;for(let j=ix-90;j<ix;j++)av+=k.v[j];av/=90;
+    if(av>0&&cv>av)s+=20;}                              // 量>90日均量 +20
+  if(ix>=7&&s1&&s1.ln){const d0=Math.abs(px-s1.ln[ix])/px*100;
+    const d6=Math.abs(k.c[ix-6]-s1.ln[ix-6])/k.c[ix-6]*100;
+    if(d0>d6)s+=20;}                                    // ST1距离较6根前扩大 +20
+  if(ix>=60){const e60=ema(k.c,60)[ix];
+    if(e60>0&&((dir===-1&&px>e60)||(dir===1&&px<e60)))s+=20;} // 价格与EMA60同向 +20
+  if(ix>=26){const md=macd(k.c)[ix];
+    if((dir===-1&&md>0)||(dir===1&&md<0))s+=10;}        // MACD同号 +10
+  return s;}
 function an(cn,h,l,c,vl,bd){const cu=c[c.length-1],ix=c.length-2;
   const s1=st(h,l,c,...CFG.S1),s2=st(h,l,c,...CFG.S2),s3=st(h,l,c,...CFG.S3);
   if(!s1||!s2||!s3||ix<1)return null;const cv=vl[ix];const lb=Math.min(90,ix-1);let av=0;
@@ -149,28 +173,32 @@ async function run(sch){
   }
 
   // ===== 以下为 V1 策略逻辑(冻结,不改) =====
-  let btcDir='';const bk=kd['BTC'];
-  if(bk&&bk.c&&bk.c.length){const s3=st(bk.h,bk.l,bk.c,...CFG.S3);if(s3){const d=s3.dr[bk.c.length-2];btcDir=d===1?'S':'L';}}
+  let btcDir='',btcST1=0;const bk=kd['BTC'];
+  if(bk&&bk.c&&bk.c.length){const s3=st(bk.h,bk.l,bk.c,...CFG.S3);if(s3){const d=s3.dr[bk.c.length-2];btcDir=d===1?'S':'L';}
+    const s1b=st(bk.h,bk.l,bk.c,...CFG.S1);if(s1b)btcST1=s1b.dr[bk.c.length-2];} // V1.6 W_btc: BTC ST1方向(仅评分用)
   const sigs=[],nos=[];
   for(const c of usePool){
     const k=kd[c];if(!k||!k.c||!k.c.length){nos.push({c});continue;}
-    const p=k.c[k.c.length-1],s3=st(k.h,k.l,k.c,...CFG.S3),dir=s3?s3.dr[k.c.length-2]:0;
-    const a=an(c,k.h,k.l,k.c,k.v,0);let sc=0,hs=0,Rv=0,dst=0,dm=0;
+    const p=k.c[k.c.length-1],s3=st(k.h,k.l,k.c,...CFG.S3),s1=st(k.h,k.l,k.c,...CFG.S1),
+          dir=s3?s3.dr[k.c.length-2]:0;
+    const a=an(c,k.h,k.l,k.c,k.v,0);let sc=0,hs=0,Rv=0,dst=0,dm=0,wbtc=0;
     if(a&&a.cT&&a.R>0.3&&a.R<=3){Rv=a.R;dst=a.sp?Math.abs(a.cu-a.sp)/a.cu*100:99;dm=a.dm;hs=dst<=3;
-      if(hs){sc=Math.round(50+Math.min(20,(Rv-0.3)/2.7*20))+Math.max(0,25-Math.abs(dst-1.5)*10)+(dm?15:0);}}
-    (hs?sigs:nos).push({c,p,dir,sc,R:Rv,dst,dm});
+      if(hs){wbtc=wbscore(dir,a.ix,k,s1,btcST1);        // V1.6 W_btc 评分门禁
+        if(wbtc>=60){sc=Math.round(50+Math.min(20,(Rv-0.3)/2.7*20))+Math.max(0,25-Math.abs(dst-1.5)*10)+(dm?15:0);}
+        else{hs=false;}}}                                // score<60 过滤
+    (hs?sigs:nos).push({c,p,dir,sc,R:Rv,dst,dm,wbtc});
   }
   sigs.sort((a,b)=>b.sc-a.sc);
   log('STRATEGY','信号:'+sigs.length+' pool='+poolMode);
-  for(const s of sigs)log('SIGNAL',s.c+' '+(s.dir===1?'S':'L')+' 评分:'+s.sc+' R:'+s.R.toFixed(1));
+  for(const s of sigs)log('SIGNAL',s.c+' '+(s.dir===1?'S':'L')+' 评分:'+s.sc+' wbtc:'+s.wbtc+' R:'+s.R.toFixed(1));
 
   const status=ok>=scanCoins.length-2?'正常':(ok>=scanCoins.length*0.7?'数据不足':'数据严重不足');
   let r='['+CFG.VERSION+'] '+ns+(btcDir?' BTC:'+btcDir:'')+' ('+poolMode+')\n';
   r+=status+' '+ok+'/'+scanCoins.length+'\n';
   if(missing.length)r+='⚠️ 缺失:'+missing.join(',')+'\n';
   if(!sigs.length)r+='无信号\n';
-  for(const s of sigs)r+=s.c+' '+(s.dir===1?'S':'L')+' '+s.sc+' R:'+s.R.toFixed(1)+' d:'+s.dst.toFixed(1)+'% $'+pf(s.p)+(s.dm?' OK':'')+'\n';
-  if(nos.length){r+='--\n';for(const x of nos)r+=x.c+' '+(x.dir?sd(x.dir):'?')+' '+(x.p?'$'+pf(x.p):'x')+(x.sc?' '+x.sc:'')+'\n';}
+  for(const s of sigs)r+=s.c+' '+(s.dir===1?'S':'L')+' '+s.sc+' R:'+s.R.toFixed(1)+' d:'+s.dst.toFixed(1)+'% $'+pf(s.p)+' w:'+s.wbtc+(s.dm?' OK':'')+'\n';
+  if(nos.length){r+='--\n';for(const x of nos)r+=x.c+' '+(x.dir?sd(x.dir):'?')+' '+(x.p?'$'+pf(x.p):'x')+(x.sc?' '+x.sc:'')+(x.wbtc?' w:'+x.wbtc:'')+'\n';}
   log('PUSH','标题:'+(sigs.length?'V1 '+sigs.map(s=>s.c+(s.dir===1?'S':'L')+'R'+s.R.toFixed(1)).join(' '):'V1 '+status));
   await pu(sigs.length?'V1 '+sigs.map(s=>s.c+(s.dir===1?'S':'L')+'R'+s.R.toFixed(1)).join(' '):'V1 '+status+' '+ok+'/'+scanCoins.length+' ('+poolMode+')',r);
   log('END','');
